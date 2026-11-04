@@ -1,0 +1,28 @@
+# Azure & Event Hubs
+azure-eventhub>=5.11.0
+azure-identity>=1.15.0
+
+# Data Science & Processing
+pyspark>=3.5.0
+delta-spark>=3.0.0
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Data Quality & Validation
+great-expectations>=0.18.0
+
+# Machine Learning & Tracking
+mlflow>=2.10.0
+scikit-learn>=1.4.0
+prophet>=1.1.5
+xgboost>=2.0.0
+
+# Utilities & Config
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+requests>=2.31.0
+
+# Testing & Linting
+pytest>=8.0.0
+ruff>=0.2.0
+black>=24.2.0
