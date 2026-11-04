@@ -409,3 +409,4 @@ class TestWeatherEnricher:
             enricher.get_temperature(48.856, 2.352)   # exactement pareil arrondi
             enricher.get_temperature(48.8561, 2.3521)  # < 0.01° de différence
             assert mock_get.call_count == 1  # une seule requête API
+

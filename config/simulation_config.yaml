@@ -93,3 +93,4 @@ output:
   max_local_files: 10
   # Afficher les logs en console
   verbose: true
+

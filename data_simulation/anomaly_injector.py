@@ -192,3 +192,4 @@ class AnomalyInjector:
         new_freq = max(45.0, min(55.0, new_freq))
         event["metrics"]["frequency_hz"] = new_freq
         return event
+
