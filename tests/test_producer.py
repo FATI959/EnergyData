@@ -267,3 +267,27 @@ class TestRunPipeline:
 
             assert mock_producer_instance.send_batch.call_count == 2
             mock_producer_instance.close.assert_called_once()
+
+
+# ===========================================================================
+# 5. Tests du Benchmark de montée en charge (Sprint 2)
+# ===========================================================================
+class TestBenchmarkRunner:
+
+    def test_benchmark_runner_executes_and_reports(self):
+        from data_simulation.benchmark_load import BenchmarkRunner
+
+        runner = BenchmarkRunner(
+            config_path="config/simulation_config.yaml",
+            num_messages=100,  # 2 batches de 50
+            duration_seconds=5,
+            is_live=False,
+        )
+        results = runner.run()
+
+        assert results["total_messages"] >= 100
+        assert results["total_batches"] >= 2
+        assert results["errors"] == 0
+        assert results["effective_throughput_msg_sec"] > 0
+        assert results["latency_p50_ms"] >= 0
+        assert "target_met" in results

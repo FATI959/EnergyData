@@ -146,7 +146,8 @@ class WeatherEnricher:
             )
             return temp
 
-        # Fallback
+        # Fallback mis en cache pour éviter la surcharge réseau en cas de coupure
+        self._cache[key] = (self.fallback_temp, time.time())
         logger.debug(
             "WeatherEnricher — Using fallback %.1f°C for (%.2f, %.2f)",
             self.fallback_temp, latitude, longitude,
