@@ -18,10 +18,10 @@ logger = logging.getLogger("00_setup_mounts")
 
 # COMMAND ----------
 # Gestion robuste de dbutils (local vs Databricks)
-try:
-    # Dans l'environnement Databricks, dbutils est pré-injecté
-    _ = dbutils.fs.mounts()
-except (NameError, AttributeError):
+# Évite toute erreur 'dbutils is not defined' dans les éditeurs locaux
+dbutils = globals().get("dbutils", None)
+
+if dbutils is None:
     class MockDBUtilsFS:
         def mounts(self):
             return []

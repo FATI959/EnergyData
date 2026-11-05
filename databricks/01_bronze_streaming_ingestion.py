@@ -33,14 +33,16 @@ def get_spark_session() -> SparkSession:
 spark = get_spark_session()
 
 # COMMAND ----------
-# Gestion sécurisée des secrets Databricks
+# Gestion sécurisée des secrets Databricks sans erreur Pylance / IDE
 def get_secret(scope: str, key: str, fallback_env_var: str = "") -> str:
     """Récupère un secret depuis Databricks Secrets ou variables d'environnement."""
     try:
-        # dbutils est injecté nativement dans le notebook Databricks
-        return dbutils.secrets.get(scope=scope, key=key)  # noqa: F821
+        dbutils_obj = globals().get("dbutils", None)
+        if dbutils_obj is not None:
+            return dbutils_obj.secrets.get(scope=scope, key=key)
     except Exception:
-        return os.getenv(fallback_env_var, "")
+        pass
+    return os.getenv(fallback_env_var, "")
 
 # COMMAND ----------
 def load_config(config_path: str = "config/databricks_config.json") -> dict[str, Any]:
@@ -165,6 +167,6 @@ def start_bronze_pipeline():
     return query
 
 # COMMAND ----------
-# Lancement du stream (dans Databricks, laissez tourner sans bloquer l'interface)
+# Lancement du stream
 if __name__ == "__main__" or "spark" in globals():
     bronze_query = start_bronze_pipeline()
