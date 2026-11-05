@@ -1,0 +1,64 @@
+{
+  "project_name": "EnergyData Lakehouse Platform",
+  "version": "1.0.0",
+  "environment": "development",
+  "storage": {
+    "account_name": "stenergydatalakehouse",
+    "container_name": "lakehouse",
+    "mount_point": "/mnt/lakehouse",
+    "paths": {
+      "bronze": "/mnt/lakehouse/bronze/energy_events",
+      "silver": "/mnt/lakehouse/silver/energy_telemetry",
+      "gold_aggregates": "/mnt/lakehouse/gold/energy_5min_aggregates",
+      "gold_anomalies": "/mnt/lakehouse/gold/detected_anomalies",
+      "gold_forecasts": "/mnt/lakehouse/gold/load_forecasts",
+      "quarantine": "/mnt/lakehouse/quarantine/invalid_events",
+      "checkpoints": {
+        "bronze": "/mnt/lakehouse/checkpoints/bronze_ingestion",
+        "silver": "/mnt/lakehouse/checkpoints/silver_cleaning",
+        "gold": "/mnt/lakehouse/checkpoints/gold_aggregations",
+        "quarantine": "/mnt/lakehouse/checkpoints/quarantine_routing"
+      }
+    },
+    "tables": {
+      "bronze": "bronze_energy_events",
+      "silver": "silver_energy_telemetry",
+      "gold_5min_aggregates": "gold_energy_5min_aggregates",
+      "gold_anomalies": "gold_detected_anomalies",
+      "gold_forecasts": "gold_load_forecasts",
+      "quarantine": "quarantine_invalid_events"
+    }
+  },
+  "event_hubs": {
+    "hub_name": "energy-telemetry-stream",
+    "consumer_group": "$Default",
+    "max_events_per_trigger": 10000,
+    "trigger_interval": "10 seconds",
+    "starting_position": "latest"
+  },
+  "secret_scope": {
+    "scope_name": "keyvault-scope",
+    "keys": {
+      "event_hubs_connection_string": "eventhubs-connection-string",
+      "event_hub_name": "eventhub-name",
+      "adls_storage_key": "adls-storage-key",
+      "service_principal_client_id": "sp-client-id",
+      "service_principal_client_secret": "sp-client-secret",
+      "tenant_id": "sp-tenant-id"
+    }
+  },
+  "streaming": {
+    "watermark_duration": "15 minutes",
+    "deduplication_keys": ["device_id", "event_time"],
+    "trigger_interval": "10 seconds"
+  },
+  "quality_rules": {
+    "voltage_min_v": 100.0,
+    "voltage_max_v": 280.0,
+    "current_min_a": 0.0,
+    "power_factor_min": 0.0,
+    "power_factor_max": 1.0,
+    "frequency_min_hz": 48.0,
+    "frequency_max_hz": 52.0
+  }
+}
