@@ -179,3 +179,4 @@ def test_quality_rules_in_config():
     assert "voltage_min_v" in qr
     assert "voltage_max_v" in qr
     assert "frequency_min_hz" in qr
+
