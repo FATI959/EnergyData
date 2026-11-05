@@ -1,46 +1,28 @@
 # Databricks notebook source
-"""
-EnergyData Lakehouse Platform — Nettoyage, Déduplication & Couche Silver
-========================================================================
-Sprint 3 | Membre A — Data Platform Engineer
+# MAGIC %md
+# MAGIC # ⚡ EnergyData Lakehouse — Nettoyage, Déduplication & Couche Silver
+# MAGIC **Sprint 3 | Data Platform Engineering**
+# MAGIC
+# MAGIC Ce notebook consomme la table Delta Bronze, applique :
+# MAGIC - Le parsing strict du payload JSON (Contrat d'Interface 1 & 2)
+# MAGIC - Le **Watermarking (15 minutes)** pour les événements en retard
+# MAGIC - La **déduplication** sur `(device_id, event_time)`
+# MAGIC - Les règles de **plausibilité physique** (`is_valid_reading`)
+# MAGIC - Le calcul de la **latence d'ingestion** (`ingestion_latency_sec`)
 
-Pipeline Spark Structured Streaming consommant la table Delta Bronze,
-réalisant le parsing strict du JSON, l'application du Watermarking (15 min),
-la déduplication des messages, la validation de plausibilité physique
-et le calcul de la latence d'ingestion.
-
-Schéma Silver généré (Contrat d'Interface 2):
-  - device_id              : STRING
-  - substation_id          : STRING
-  - zone                   : STRING
-  - event_time             : TIMESTAMP
-  - voltage_v              : DOUBLE
-  - current_a              : DOUBLE
-  - active_power_kw        : DOUBLE
-  - reactive_power_kvar    : DOUBLE
-  - power_factor           : DOUBLE
-  - frequency_hz           : DOUBLE
-  - ambient_temp_c         : DOUBLE
-  - status_flag            : STRING
-  - is_valid_reading       : BOOLEAN
-  - ingestion_latency_sec  : DOUBLE
-  - ingestion_timestamp    : TIMESTAMP
-"""
-
+# COMMAND ----------
 import json
 import logging
-import os
-from typing import Dict, Any
+from typing import Any
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
-    current_timestamp,
     from_json,
+    lit,
     to_timestamp,
     unix_timestamp,
     when,
-    lit,
 )
 from pyspark.sql.types import (
     DoubleType,
@@ -49,14 +31,23 @@ from pyspark.sql.types import (
     StructType,
 )
 
-# Logging
+# Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("02_silver_cleaning")
 
+# COMMAND ----------
+def get_spark_session() -> SparkSession:
+    """Récupère ou crée la session Spark."""
+    return SparkSession.builder \
+        .appName("EnergyData_Silver_Cleaning_Enrichment") \
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+        .getOrCreate()
 
-# ---------------------------------------------------------------------------
-# Schéma JSON du Payload IoT (Contrat d'Interface 1)
-# ---------------------------------------------------------------------------
+spark = get_spark_session()
+
+# COMMAND ----------
+# Schéma du payload IoT selon Contrat d'Interface 1
 IOT_PAYLOAD_SCHEMA = StructType([
     StructField("device_id", StringType(), False),
     StructField("timestamp", StringType(), False),
@@ -86,21 +77,11 @@ IOT_PAYLOAD_SCHEMA = StructType([
     StructField("status_flag", StringType(), True),
 ])
 
-
-# ---------------------------------------------------------------------------
-# Initialisation session Spark
-# ---------------------------------------------------------------------------
-def get_spark_session() -> SparkSession:
-    return SparkSession.builder \
-        .appName("EnergyData_Silver_Cleaning_Enrichment") \
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .getOrCreate()
-
-
-def load_config(config_path: str = "config/databricks_config.json") -> Dict[str, Any]:
+# COMMAND ----------
+def load_config(config_path: str = "config/databricks_config.json") -> dict[str, Any]:
+    """Charge la configuration du pipeline Silver."""
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {
@@ -111,18 +92,11 @@ def load_config(config_path: str = "config/databricks_config.json") -> Dict[str,
                     "quarantine": "/mnt/lakehouse/quarantine/invalid_events",
                     "checkpoints": {
                         "silver": "/mnt/lakehouse/checkpoints/silver_cleaning",
-                        "quarantine": "/mnt/lakehouse/checkpoints/quarantine_routing",
                     },
-                },
-                "tables": {
-                    "bronze": "bronze_energy_events",
-                    "silver": "silver_energy_telemetry",
-                    "quarantine": "quarantine_invalid_events",
                 },
             },
             "streaming": {
                 "watermark_duration": "15 minutes",
-                "deduplication_keys": ["device_id", "event_time"],
                 "trigger_interval": "10 seconds",
             },
             "quality_rules": {
@@ -136,25 +110,13 @@ def load_config(config_path: str = "config/databricks_config.json") -> Dict[str,
             },
         }
 
-
-# ---------------------------------------------------------------------------
-# Transformations Silver
-# ---------------------------------------------------------------------------
+# COMMAND ----------
 def parse_and_clean_bronze_to_silver(
     bronze_df,
     watermark_duration: str = "15 minutes",
-    quality_rules: Dict[str, float] = None,
+    quality_rules: dict[str, float] | None = None,
 ):
-    """
-    Transforme le flux Bronze en DataFrame Silver nettoyé :
-      1. Parsing JSON du payload brut
-      2. Extraction et aplatissement des colonnes métiers
-      3. Typage strict et conversion d'event_time en TIMESTAMP
-      4. Définition du Watermark pour les données en retard
-      5. Déduplication par (device_id, event_time)
-      6. Validation des règles d'intégrité physique (is_valid_reading)
-      7. Calcul de la latence d'ingestion (ingestion_latency_sec)
-    """
+    """Transforme le flux Bronze en DataFrame Silver nettoyé."""
     if quality_rules is None:
         quality_rules = {
             "voltage_min_v": 100.0,
@@ -166,13 +128,13 @@ def parse_and_clean_bronze_to_silver(
             "frequency_max_hz": 52.0,
         }
 
-    # 1. Parsing JSON
+    # 1. Parsing JSON du payload brut
     parsed_df = bronze_df.withColumn(
         "parsed",
         from_json(col("raw_payload"), IOT_PAYLOAD_SCHEMA),
     )
 
-    # 2. Aplatissement & Typage
+    # 2. Aplatissement des métriques et localisation
     flattened_df = parsed_df.select(
         col("parsed.device_id").alias("device_id"),
         col("parsed.substation_id").alias("substation_id"),
@@ -189,15 +151,15 @@ def parse_and_clean_bronze_to_silver(
         col("ingestion_timestamp"),
     )
 
-    # 3. Filtrage des enregistrements malformés (device_id ou event_time manquant)
-    non_null_df = flattened_df.filter(
+    # 3. Filtrage des enregistrements orphelins (clés obligatoires)
+    valid_keys_df = flattened_df.filter(
         col("device_id").isNotNull() & col("event_time").isNotNull()
     )
 
-    # 4. Watermarking
-    watermarked_df = non_null_df.withWatermark("event_time", watermark_duration)
+    # 4. Watermarking pour gestion des retards
+    watermarked_df = valid_keys_df.withWatermark("event_time", watermark_duration)
 
-    # 5. Déduplication en continu
+    # 5. Déduplication des messages sur (device_id, event_time)
     deduped_df = watermarked_df.dropDuplicates(["device_id", "event_time"])
 
     # 6. Règles de validité physique
@@ -214,96 +176,47 @@ def parse_and_clean_bronze_to_silver(
         when(validity_condition, lit(True)).otherwise(lit(False)),
     )
 
-    # 7. Calcul de la latence de traitement
-    silver_df = validated_df.withColumn(
+    # 7. Calcul de la latence d'ingestion en secondes
+    return validated_df.withColumn(
         "ingestion_latency_sec",
         (unix_timestamp(col("ingestion_timestamp")) - unix_timestamp(col("event_time"))).cast(DoubleType()),
     )
 
-    return silver_df
-
-
-def write_silver_delta_stream(
-    silver_df,
-    table_path: str,
-    checkpoint_path: str,
-    table_name: str = "silver_energy_telemetry",
-    trigger_interval: str = "10 seconds",
-    available_now: bool = False,
-):
-    """
-    Écrit le flux Silver nettoyé dans la table Delta Lake.
-    """
-    writer = silver_df.writeStream \
-        .format("delta") \
-        .outputMode("append") \
-        .option("checkpointLocation", checkpoint_path) \
-        .option("mergeSchema", "true")
-
-    if available_now:
-        writer = writer.trigger(availableNow=True)
-    else:
-        writer = writer.trigger(processingTime=trigger_interval)
-
-    logger.info(f"Démarrage du flux Silver vers : {table_path} (Table: {table_name})")
-    query = writer.toTable(table_name) if spark_table_exists(table_name) else writer.start(table_path)
-    return query
-
-
-def spark_table_exists(table_name: str) -> bool:
-    try:
-        spark = SparkSession.getActiveSession()
-        return spark is not None and spark.catalog.tableExists(table_name)
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Point d'entrée principal
-# ---------------------------------------------------------------------------
-def main():
-    logger.info("=== Démarrage du pipeline de nettoyage Silver (Sprint 3) ===")
-    spark = get_spark_session()
+# COMMAND ----------
+def start_silver_pipeline():
+    """Initialise et lance la requête de streaming vers la table Delta Silver."""
     config = load_config()
+    storage_cfg = config.get("storage", {})
+    bronze_path = storage_cfg.get("paths", {}).get("bronze", "/mnt/lakehouse/bronze/energy_events")
+    silver_path = storage_cfg.get("paths", {}).get("silver", "/mnt/lakehouse/silver/energy_telemetry")
+    checkpoint_path = storage_cfg.get("paths", {}).get("checkpoints", {}).get("silver", "/mnt/lakehouse/checkpoints/silver_cleaning")
 
-    bronze_path = config.get("storage", {}).get("paths", {}).get("bronze", "/mnt/lakehouse/bronze/energy_events")
-    bronze_table = config.get("storage", {}).get("tables", {}).get("bronze", "bronze_energy_events")
-    silver_path = config.get("storage", {}).get("paths", {}).get("silver", "/mnt/lakehouse/silver/energy_telemetry")
-    silver_table = config.get("storage", {}).get("tables", {}).get("silver", "silver_energy_telemetry")
-    checkpoint_path = config.get("storage", {}).get("paths", {}).get("checkpoints", {}).get("silver", "/mnt/lakehouse/checkpoints/silver_cleaning")
-
-    watermark_duration = config.get("streaming", {}).get("watermark_duration", "15 minutes")
-    trigger_interval = config.get("streaming", {}).get("trigger_interval", "10 seconds")
+    streaming_cfg = config.get("streaming", {})
+    watermark_duration = streaming_cfg.get("watermark_duration", "15 minutes")
+    trigger_interval = streaming_cfg.get("trigger_interval", "10 seconds")
     quality_rules = config.get("quality_rules", {})
 
-    # Lecture du flux Bronze
-    logger.info(f"Lecture du flux Delta Bronze depuis : {bronze_path}")
-    try:
-        bronze_stream = spark.readStream.format("delta").load(bronze_path)
-    except Exception as e:
-        logger.warning(f"Chemin Bronze inaccessible ({e}). Tentative par nom de table '{bronze_table}'.")
-        bronze_stream = spark.readStream.format("delta").table(bronze_table)
+    logger.info(f"Lecture de la table Delta Bronze depuis : {bronze_path}")
+    bronze_stream = spark.readStream.format("delta").load(bronze_path)
 
-    # Transformation & nettoyage
     silver_stream = parse_and_clean_bronze_to_silver(
         bronze_df=bronze_stream,
         watermark_duration=watermark_duration,
         quality_rules=quality_rules,
     )
 
-    # Écriture dans la table Silver
-    query = write_silver_delta_stream(
-        silver_df=silver_stream,
-        table_path=silver_path,
-        checkpoint_path=checkpoint_path,
-        table_name=silver_table,
-        trigger_interval=trigger_interval,
-    )
+    query = silver_stream.writeStream \
+        .format("delta") \
+        .outputMode("append") \
+        .option("checkpointLocation", checkpoint_path) \
+        .option("mergeSchema", "true") \
+        .trigger(processingTime=trigger_interval) \
+        .start(silver_path)
 
-    logger.info(f"Stream Silver actif avec ID : {query.id}")
+    logger.info(f"Stream Silver actif (Query ID: {query.id}) vers {silver_path}")
     return query
 
-
-if __name__ == "__main__":
-    query = main()
-    # query.awaitTermination()
+# COMMAND ----------
+# Lancement du stream
+if __name__ == "__main__" or "spark" in globals():
+    silver_query = start_silver_pipeline()

@@ -1,55 +1,52 @@
 # Databricks notebook source
-"""
-EnergyData Lakehouse Platform — Ingestion Streaming Bronze
-============================================================
-Sprint 3 | Membre A — Data Platform Engineer
+# MAGIC %md
+# MAGIC # ⚡ EnergyData Lakehouse — Ingestion Streaming Bronze
+# MAGIC **Sprint 3 | Data Platform Engineering**
+# MAGIC
+# MAGIC Ce notebook capture les flux IoT en streaming continu depuis Azure Event Hubs
+# MAGIC et les enregistre dans la table Delta Lake **Bronze** avec horodatage et partitionnement.
 
-Pipeline Spark Structured Streaming de capture continue des événements IoT
-depuis Azure Event Hubs vers la couche Bronze Delta Lake.
-
-Schéma Bronze généré:
-  - raw_payload         : STRING (JSON brut sans altération)
-  - enqueued_time       : TIMESTAMP (Horodatage Event Hubs)
-  - ingestion_timestamp : TIMESTAMP (Date d'ingestion = current_timestamp())
-  - partition_date      : DATE (Partition physique = to_date(ingestion_timestamp))
-  - source_system       : STRING ("Azure_Event_Hubs")
-
-Usage:
-  Exécuter dans Databricks avec un cluster All-Purpose ou Job Cluster.
-"""
-
+# COMMAND ----------
 import json
 import logging
 import os
 import re
-from typing import Dict, Any
+from typing import Any
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp, lit, to_date
 
-# Logging
+# Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("01_bronze_ingestion")
 
-
-# ---------------------------------------------------------------------------
-# Initialisation de session Spark
-# ---------------------------------------------------------------------------
+# COMMAND ----------
+# Récupération ou initialisation de la session Spark
 def get_spark_session() -> SparkSession:
-    """Récupère ou initialise la session Spark active avec Delta Lake."""
+    """Récupère la session Spark active ou en crée une pour l'exécution locale."""
     return SparkSession.builder \
         .appName("EnergyData_Bronze_Streaming_Ingestion") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
 
+spark = get_spark_session()
 
-# ---------------------------------------------------------------------------
-# Chargement de la configuration
-# ---------------------------------------------------------------------------
-def load_config(config_path: str = "config/databricks_config.json") -> Dict[str, Any]:
+# COMMAND ----------
+# Gestion sécurisée des secrets Databricks
+def get_secret(scope: str, key: str, fallback_env_var: str = "") -> str:
+    """Récupère un secret depuis Databricks Secrets ou variables d'environnement."""
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        # dbutils est injecté nativement dans le notebook Databricks
+        return dbutils.secrets.get(scope=scope, key=key)  # noqa: F821
+    except Exception:
+        return os.getenv(fallback_env_var, "")
+
+# COMMAND ----------
+def load_config(config_path: str = "config/databricks_config.json") -> dict[str, Any]:
+    """Charge la configuration du projet."""
+    try:
+        with open(config_path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {
@@ -71,28 +68,21 @@ def load_config(config_path: str = "config/databricks_config.json") -> Dict[str,
             },
         }
 
-
+# COMMAND ----------
 def extract_namespace_from_conn_str(conn_str: str) -> str:
-    """Extrait le nom du namespace Event Hubs depuis la chaîne de connexion."""
+    """Extrait le namespace Service Bus depuis la chaîne de connexion."""
     match = re.search(r"Endpoint=sb://([^.]+)\.servicebus\.windows\.net", conn_str)
-    if match:
-        return match.group(1)
-    return "sb-energy-telemetry"
+    return match.group(1) if match else "sb-energy-telemetry"
 
-
-# ---------------------------------------------------------------------------
-# Construction du Stream Ingestion
-# ---------------------------------------------------------------------------
 def create_eventhubs_kafka_stream(
-    spark: SparkSession,
+    spark_session: SparkSession,
     conn_str: str,
     event_hub_name: str,
     starting_offsets: str = "latest",
 ):
     """
-    Crée un DataFrame de streaming en utilisant le protocole Kafka exposé nativement
-    par Azure Event Hubs (port 9093 avec SASL_SSL/PLAIN).
-    Cette méthode est universelle et ne requiert pas de JAR externe tiers sur Databricks.
+    Connecte Spark Structured Streaming au endpoint Kafka natif d'Azure Event Hubs (port 9093).
+    Ne requiert aucun JAR propriétaire externe sur Databricks.
     """
     namespace = extract_namespace_from_conn_str(conn_str)
     bootstrap_servers = f"{namespace}.servicebus.windows.net:9093"
@@ -102,8 +92,7 @@ def create_eventhubs_kafka_stream(
     )
 
     logger.info(f"Connexion au endpoint Kafka Event Hubs : {bootstrap_servers}")
-
-    return spark.readStream \
+    return spark_session.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", bootstrap_servers) \
         .option("subscribe", event_hub_name) \
@@ -114,17 +103,9 @@ def create_eventhubs_kafka_stream(
         .option("failOnDataLoss", "false") \
         .load()
 
-
+# COMMAND ----------
 def transform_to_bronze_schema(raw_df):
-    """
-    Applique la standardisation du schéma Bronze :
-      - raw_payload : payload JSON brut décodé en UTF-8
-      - enqueued_time : horodatage de réception Event Hubs
-      - ingestion_timestamp : horodatage d'écriture Delta
-      - partition_date : date de partitionnement
-      - source_system : métadonnée d'origine
-    """
-    # Détection automatique de la colonne payload (Kafka = 'value', EventHubs Spark = 'body')
+    """Standardise les colonnes d'ingestion vers le schéma Bronze."""
     payload_col = col("value").cast("string") if "value" in raw_df.columns else col("body").cast("string")
     time_col = col("timestamp") if "timestamp" in raw_df.columns else col("enqueuedTime")
 
@@ -136,72 +117,24 @@ def transform_to_bronze_schema(raw_df):
         lit("Azure_Event_Hubs").alias("source_system"),
     )
 
-
-def write_bronze_delta_stream(
-    bronze_df,
-    table_path: str,
-    checkpoint_path: str,
-    table_name: str = "bronze_energy_events",
-    trigger_interval: str = "10 seconds",
-    available_now: bool = False,
-):
-    """
-    Écrit le flux Bronze dans Delta Lake avec partitionnement par partition_date.
-    """
-    writer = bronze_df.writeStream \
-        .format("delta") \
-        .outputMode("append") \
-        .partitionBy("partition_date") \
-        .option("checkpointLocation", checkpoint_path) \
-        .option("mergeSchema", "true")
-
-    if available_now:
-        # Mode batch/one-shot idéal pour les tests d'intégration CI/CD
-        writer = writer.trigger(availableNow=True)
-    else:
-        writer = writer.trigger(processingTime=trigger_interval)
-
-    # Écriture par chemin (ou enregistrement au metastore)
-    logger.info(f"Démarrage du flux Bronze vers : {table_path} (Table: {table_name})")
-    query = writer.toTable(table_name) if spark_table_exists(table_name) else writer.start(table_path)
-    return query
-
-
-def spark_table_exists(table_name: str) -> bool:
-    try:
-        spark = SparkSession.getActiveSession()
-        return spark is not None and spark.catalog.tableExists(table_name)
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Point d'entrée principal
-# ---------------------------------------------------------------------------
-def main():
-    logger.info("=== Démarrage du pipeline de streaming Bronze (Sprint 3) ===")
-    spark = get_spark_session()
+# COMMAND ----------
+def start_bronze_pipeline():
+    """Initialise et lance la requête de streaming vers la table Delta Bronze."""
     config = load_config()
+    scope_cfg = config.get("secret_scope", {})
+    scope_name = scope_cfg.get("scope_name", "keyvault-scope")
+    secret_key = scope_cfg.get("keys", {}).get("event_hubs_connection_string", "eventhubs-connection-string")
 
-    # Récupération de la chaîne de connexion (Secrets Databricks ou env)
-    scope_name = config.get("secret_scope", {}).get("scope_name", "keyvault-scope")
-    secret_key = config.get("secret_scope", {}).get("keys", {}).get("event_hubs_connection_string", "eventhubs-connection-string")
-
-    try:
-        import dbutils
-        conn_str = dbutils.secrets.get(scope=scope_name, key=secret_key)
-    except Exception:
-        conn_str = os.getenv("EVENT_HUBS_CONNECTION_STRING", "")
-
+    conn_str = get_secret(scope=scope_name, key=secret_key, fallback_env_var="EVENT_HUBS_CONNECTION_STRING")
     event_hub_name = config.get("event_hubs", {}).get("hub_name", "energy-telemetry-stream")
     trigger_interval = config.get("event_hubs", {}).get("trigger_interval", "10 seconds")
-    bronze_path = config.get("storage", {}).get("paths", {}).get("bronze", "/mnt/lakehouse/bronze/energy_events")
-    checkpoint_path = config.get("storage", {}).get("paths", {}).get("checkpoints", {}).get("bronze", "/mnt/lakehouse/checkpoints/bronze_ingestion")
-    table_name = config.get("storage", {}).get("tables", {}).get("bronze", "bronze_energy_events")
+
+    storage_cfg = config.get("storage", {})
+    bronze_path = storage_cfg.get("paths", {}).get("bronze", "/mnt/lakehouse/bronze/energy_events")
+    checkpoint_path = storage_cfg.get("paths", {}).get("checkpoints", {}).get("bronze", "/mnt/lakehouse/checkpoints/bronze_ingestion")
 
     if not conn_str:
-        logger.warning("Aucune chaîne de connexion Event Hubs fournie. Initialisation d'un stream local simulé.")
-        # Flux de test local pour démonstration
+        logger.warning("Chaîne de connexion Event Hubs non configurée. Démarrage en mode flux simulé.")
         raw_stream = spark.readStream.format("rate").option("rowsPerSecond", 5).load()
         sample_json = (
             '{"device_id": "METER_SECTOR_A_001", "timestamp": "2026-10-15T14:15:00.000Z", '
@@ -212,25 +145,26 @@ def main():
         raw_stream = raw_stream.select(lit(sample_json).alias("value"), col("timestamp"))
     else:
         raw_stream = create_eventhubs_kafka_stream(
-            spark=spark,
+            spark_session=spark,
             conn_str=conn_str,
             event_hub_name=event_hub_name,
         )
 
-    bronze_stream = transform_to_bronze_schema(raw_stream)
-    query = write_bronze_delta_stream(
-        bronze_df=bronze_stream,
-        table_path=bronze_path,
-        checkpoint_path=checkpoint_path,
-        table_name=table_name,
-        trigger_interval=trigger_interval,
-    )
+    bronze_df = transform_to_bronze_schema(raw_stream)
 
-    logger.info(f"Stream Bronze actif avec ID : {query.id}")
+    query = bronze_df.writeStream \
+        .format("delta") \
+        .outputMode("append") \
+        .partitionBy("partition_date") \
+        .option("checkpointLocation", checkpoint_path) \
+        .option("mergeSchema", "true") \
+        .trigger(processingTime=trigger_interval) \
+        .start(bronze_path)
+
+    logger.info(f"Stream Bronze actif (Query ID: {query.id}) vers {bronze_path}")
     return query
 
-
-if __name__ == "__main__":
-    query = main()
-    # Dans Databricks, laisser tourner la requête de streaming
-    # query.awaitTermination()
+# COMMAND ----------
+# Lancement du stream (dans Databricks, laissez tourner sans bloquer l'interface)
+if __name__ == "__main__" or "spark" in globals():
+    bronze_query = start_bronze_pipeline()

@@ -1,51 +1,41 @@
 # Databricks notebook source
-"""
-EnergyData Lakehouse Platform — ADLS Gen2 & Key Vault Setup
-=============================================================
-Sprint 3 | Membre A — Data Platform Engineer
+# MAGIC %md
+# MAGIC # ⚡ EnergyData Lakehouse — Configuration du Stockage ADLS Gen2
+# MAGIC **Sprint 3 | Data Platform Engineering**
+# MAGIC
+# MAGIC Ce notebook configure le point de montage Azure Data Lake Storage Gen2 (ADLS Gen2)
+# MAGIC sur DBFS (`/mnt/lakehouse`) et initialise les répertoires Medallion (Bronze, Silver, Gold).
 
-Configure le point de montage Azure Data Lake Storage Gen2 (ADLS Gen2)
-dans Databricks (DBFS) et initialise l'arborescence Medallion (Bronze, Silver, Gold).
-Utilise Databricks Secrets (connecté à Azure Key Vault) pour la sécurité.
-
-Usage dans Databricks:
-    Exécuter ce notebook une fois lors de l'initialisation du cluster.
-"""
-
+# COMMAND ----------
 import json
 import logging
-from typing import Dict, Any
+import os
+from typing import Any
 
-# Logging
+# Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("00_setup_mounts")
 
-# ---------------------------------------------------------------------------
-# Fallback helper pour exécution hors Databricks (tests locaux / CI)
-# ---------------------------------------------------------------------------
+# COMMAND ----------
+# Gestion robuste de dbutils (local vs Databricks)
 try:
-    # Dans Databricks runtime, dbutils et spark sont injectés automatiquement
-    dbutils_available = "dbutils" in globals()
-except NameError:
-    dbutils_available = False
-
-if not dbutils_available:
+    # Dans l'environnement Databricks, dbutils est pré-injecté
+    _ = dbutils.fs.mounts()
+except (NameError, AttributeError):
     class MockDBUtilsFS:
         def mounts(self):
             return []
         def mount(self, source, mount_point, extra_configs=None):
-            logger.info(f"[MOCK] Mounted {source} to {mount_point}")
+            logger.info(f"[SIMULATION] Montage de {source} vers {mount_point}")
         def unmount(self, mount_point):
-            logger.info(f"[MOCK] Unmounted {mount_point}")
+            logger.info(f"[SIMULATION] Démontage de {mount_point}")
         def mkdirs(self, path):
-            logger.info(f"[MOCK] Created directory {path}")
+            logger.info(f"[SIMULATION] Création du dossier {path}")
         def ls(self, path):
             return []
 
     class MockDBUtilsSecrets:
         def get(self, scope, key):
-            import os
-            # Fallback sur variable d'environnement locale si disponible
             env_map = {
                 "adls-storage-key": os.getenv("AZURE_STORAGE_KEY", "mock-storage-key"),
                 "eventhubs-connection-string": os.getenv("EVENT_HUBS_CONNECTION_STRING", "mock-eh-conn"),
@@ -57,19 +47,15 @@ if not dbutils_available:
         secrets = MockDBUtilsSecrets()
 
     dbutils = MockDBUtils()
-    logger.info("dbutils non détecté — mode simulation local activé.")
+    logger.info("dbutils émulé localement (hors cluster Databricks).")
 
-
-# ---------------------------------------------------------------------------
-# Fonctions de configuration & montage
-# ---------------------------------------------------------------------------
-def load_config(config_path: str = "config/databricks_config.json") -> Dict[str, Any]:
-    """Charge la configuration Databricks depuis le JSON du projet."""
+# COMMAND ----------
+def load_config(config_path: str = "config/databricks_config.json") -> dict[str, Any]:
+    """Charge la configuration du Lakehouse."""
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        logger.warning(f"Fichier de configuration {config_path} non trouvé. Utilisation des valeurs par défaut.")
         return {
             "storage": {
                 "account_name": "stenergydatalakehouse",
@@ -78,13 +64,11 @@ def load_config(config_path: str = "config/databricks_config.json") -> Dict[str,
             },
             "secret_scope": {
                 "scope_name": "keyvault-scope",
-                "keys": {
-                    "adls_storage_key": "adls-storage-key",
-                }
-            }
+                "keys": {"adls_storage_key": "adls-storage-key"},
+            },
         }
 
-
+# COMMAND ----------
 def mount_adls_gen2(
     storage_account: str,
     container_name: str,
@@ -92,28 +76,20 @@ def mount_adls_gen2(
     secret_scope: str = "keyvault-scope",
     secret_key_name: str = "adls-storage-key",
     use_service_principal: bool = False,
-    client_id: str = None,
-    client_secret: str = None,
-    tenant_id: str = None,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    tenant_id: str | None = None,
 ) -> bool:
-    """
-    Monte un conteneur ADLS Gen2 sur DBFS si ce n'est pas déjà fait.
-
-    Supporte :
-      1. Clé de compte de stockage via Secret Scope (méthode rapide)
-      2. Service Principal OAuth (méthode de production recommandée)
-    """
+    """Monte le stockage ADLS Gen2 sur DBFS de manière idempotente."""
     source_uri = f"wasbs://{container_name}@{storage_account}.blob.core.windows.net"
 
-    # Vérifier si déjà monté
-    current_mounts = [m.mountPoint for m in dbutils.fs.mounts()]
-    if mount_point in current_mounts:
-        logger.info(f"Le point de montage '{mount_point}' existe déjà.")
-        return True
-
-    logger.info(f"Montage de '{source_uri}' sur '{mount_point}'...")
-
     try:
+        current_mounts = [m.mountPoint for m in dbutils.fs.mounts()]
+        if mount_point in current_mounts:
+            logger.info(f"Le point de montage '{mount_point}' existe déjà.")
+            return True
+
+        logger.info(f"Montage de '{source_uri}' sur '{mount_point}'...")
         if use_service_principal and client_id and client_secret and tenant_id:
             extra_configs = {
                 "fs.azure.account.auth.type": "OAuth",
@@ -122,7 +98,6 @@ def mount_adls_gen2(
                 "fs.azure.account.oauth2.client.secret": client_secret,
                 "fs.azure.account.oauth2.client.endpoint": f"https://login.microsoftonline.com/{tenant_id}/oauth2/token",
             }
-            # URI pour driver ABFSS natif
             abfss_uri = f"abfss://{container_name}@{storage_account}.dfs.core.windows.net/"
             dbutils.fs.mount(source=abfss_uri, mount_point=mount_point, extra_configs=extra_configs)
         else:
@@ -136,15 +111,12 @@ def mount_adls_gen2(
         return True
 
     except Exception as e:
-        logger.error(f"Échec du montage ADLS : {str(e)}")
-        # Ne pas bloquer si exécuté en sandbox
+        logger.warning(f"Montage non complété ({e}). Mode simulation DBFS conservé.")
         return False
 
-
+# COMMAND ----------
 def initialize_lakehouse_directories(mount_point: str) -> None:
-    """
-    Crée l'arborescence des répertoires Medallion (Bronze, Silver, Gold, Quarantaine, Checkpoints).
-    """
+    """Crée l'arborescence Medallion sous le point de montage."""
     directories = [
         f"{mount_point}/bronze/energy_events",
         f"{mount_point}/silver/energy_telemetry",
@@ -157,45 +129,32 @@ def initialize_lakehouse_directories(mount_point: str) -> None:
         f"{mount_point}/checkpoints/gold_aggregations",
         f"{mount_point}/checkpoints/quarantine_routing",
     ]
-
     for d in directories:
         try:
             dbutils.fs.mkdirs(d)
-            logger.info(f"Dossier initialisé : {d}")
         except Exception as e:
-            logger.warning(f"Impossible de créer le dossier {d} : {e}")
+            logger.debug(f"Info création dossier {d}: {e}")
 
+# COMMAND ----------
+# Exécution du montage
+config = load_config()
+storage_cfg = config.get("storage", {})
+scope_cfg = config.get("secret_scope", {})
 
-# ---------------------------------------------------------------------------
-# Point d'entrée principal
-# ---------------------------------------------------------------------------
-def main():
-    logger.info("=== Initialisation du Montage Lakehouse ADLS Gen2 ===")
-    config = load_config()
+account_name = storage_cfg.get("account_name", "stenergydatalakehouse")
+container_name = storage_cfg.get("container_name", "lakehouse")
+mount_point = storage_cfg.get("mount_point", "/mnt/lakehouse")
+scope_name = scope_cfg.get("scope_name", "keyvault-scope")
+secret_key = scope_cfg.get("keys", {}).get("adls_storage_key", "adls-storage-key")
 
-    storage_cfg = config.get("storage", {})
-    scope_cfg = config.get("secret_scope", {})
+mounted = mount_adls_gen2(
+    storage_account=account_name,
+    container_name=container_name,
+    mount_point=mount_point,
+    secret_scope=scope_name,
+    secret_key_name=secret_key,
+)
 
-    account_name = storage_cfg.get("account_name", "stenergydatalakehouse")
-    container_name = storage_cfg.get("container_name", "lakehouse")
-    mount_point = storage_cfg.get("mount_point", "/mnt/lakehouse")
-    scope_name = scope_cfg.get("scope_name", "keyvault-scope")
-    secret_key = scope_cfg.get("keys", {}).get("adls_storage_key", "adls-storage-key")
-
-    mounted = mount_adls_gen2(
-        storage_account=account_name,
-        container_name=container_name,
-        mount_point=mount_point,
-        secret_scope=scope_name,
-        secret_key_name=secret_key,
-    )
-
-    if mounted:
-        initialize_lakehouse_directories(mount_point)
-        logger.info("=== Configuration du stockage Lakehouse terminée avec succès ===")
-    else:
-        logger.warning("Montage non complété. Vérifiez vos identifiants Azure / Key Vault.")
-
-
-if __name__ == "__main__":
-    main()
+if mounted:
+    initialize_lakehouse_directories(mount_point)
+    logger.info("Stockage Medallion prêt pour l'ingestion.")
