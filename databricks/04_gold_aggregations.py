@@ -22,8 +22,8 @@
 
 import logging
 import os
+from typing import TYPE_CHECKING
 
-from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -33,6 +33,17 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
+
+# delta-spark est disponible uniquement dans l'environnement Databricks.
+# TYPE_CHECKING = False au runtime → pas d'ImportError local.
+# Pylance voit le type pour l'autocomplétion sans lever d'erreur.
+if TYPE_CHECKING:
+    from delta.tables import DeltaTable  # noqa: F401
+else:
+    try:
+        from delta.tables import DeltaTable
+    except ImportError:
+        DeltaTable = None  # type: ignore[assignment,misc]
 
 # COMMAND ----------
 # Cellule 2 — Configuration du logging
@@ -263,7 +274,8 @@ def init_ml_tables(spark_session: SparkSession) -> None:
         (forecasts_schema, GOLD_FORECASTS_PATH, "gold_load_forecasts"),
     ]:
         try:
-            if DeltaTable.isDeltaTable(spark_session, path):
+            # DeltaTable est None en environnement local (pas de delta-spark installé)
+            if DeltaTable is not None and DeltaTable.isDeltaTable(spark_session, path):
                 logger.info("Table '%s' existe déjà — skip.", table_name)
                 continue
         except Exception:
